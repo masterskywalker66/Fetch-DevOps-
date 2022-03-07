@@ -1,43 +1,40 @@
 
+from distutils.command.config import config
 import yaml
 import boto3, time
+import paramiko
 from collections import defaultdict
 import traceback
+import os.path
 
-KEYNAME = 'fetch-keypair'
+KEYNAME = 'fetch-keypair' 
 IMAGES = {}
 IMAGES ['amzn2-hvm-x86_64'] = 'ami-033b95fb8079dc481'
 # IP range of machines requiring SSH access
 MYIP = '0.0.0.0/0'
 
-def send_cmd(region,cmd,id):
-    """ Use describe instance information to get instance id base on region """
-    ssm_filter = [{'Key': 'tag:SSM', 'Values': ['ssm-cmd']}]
-    ssm = boto3.client('ssm', region_name=region)
-    #instance_info = ssm.describe_instance_information(Filters=ssm_filter).get('InstanceInformationList', {})[0]
-    #instance_id = instance_info.get('InstanceId', '')
-    response = ssm.send_command(InstanceIds=[id],
-                                DocumentName='AWS-RunShellScript',
-                                Parameters={"commands": [cmd]}
-                                )
-    command_id = response.get('Command', {}).get("CommandId", None)
-    while True:
-        """ Wait for SSM response """
-        response = ssm.list_command_invocations(CommandId=command_id, Details=True)
-        """ If the command hasn't started to run yet, keep waiting """
-        if len(response['CommandInvocations']) == 0:
-            time.sleep(1)
-            continue
-        invocation = response['CommandInvocations'][0]
-        if invocation['Status'] not in ('Pending', 'InProgress', 'Cancelling'):
-            break
-        time.sleep(1)
-    command_plugin = invocation['CommandPlugins'][-1]
-    output = command_plugin['Output']
-    print(f"Complete running, output: {output}")
+def send_cmd(cmd,id):
+    
+    ec2 = boto3.Session(profile_name='default', region_name='us-east-1').client('ec2')
+
+    ROOT_DIR = os.path.dirname(os.path.abspath("fetch_keypair.pem"))
+    ROOT_DIR = ROOT_DIR + "/fetch-keypair.pem"
+    k = paramiko.RSAKey.from_private_key_file(ROOT_DIR)
+    c = paramiko.SSHClient()
+    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    print(id,k)
+    c.connect(hostname=id, username='ec2-user', pkey=k)   
+
+    for command in cmd:
+        print("Executing: {}".format(command))
+        stdin , stdout, stderr = c.exec_command(command)
+        print(stdout.read().decode('ascii'))
+        #print(stderr.read())
+
+    c.close()
 
 print("Reading YAML file")
-with open('testconfig.yaml', 'r') as yaml_file:
+with open('config.yaml', 'r') as yaml_file:
     try:
         print("Safeloading YAML")
         jsonFormat = yaml.safe_load(yaml_file)
@@ -47,16 +44,18 @@ with open('testconfig.yaml', 'r') as yaml_file:
 print("Defining Volumes and users")
 try:
     ec2 = boto3.resource('ec2')
-   
+    ROOT_DIR = os.path.dirname(os.path.abspath("config.yaml"))
+    ROOT_DIR = ROOT_DIR + "/fetch-keypair.pem"
+    if not os.path.exists(ROOT_DIR):
     # create keypairs
-    with open(KEYNAME+'.pem', 'w') as keyPairFile:
-        try:
-            key_pair = ec2.create_key_pair(KeyName=KEYNAME)
-            print("KeyPair ",key_pair.key_material)
-            keyPairFile.write(str(key_pair.key_material))
-        except Exception as e:
-            print('Key pair already exists')
-            #print(e)
+        with open(KEYNAME+'.pem', 'w') as keyPairFile:
+            try:
+                key_pair = ec2.create_key_pair(KeyName=KEYNAME)
+                print("KeyPair ",key_pair.key_material)
+                keyPairFile.write(str(key_pair.key_material))
+            except Exception as e:
+                print('Key pair already exists')
+                #print(e)
 
     conf = jsonFormat['server']
 
@@ -80,15 +79,15 @@ try:
         usercmds += 'mount -o rw %s %s\n' % (i['device'], i['mount'])
 
     for i in usr:
-        usercmds += 'adduser %s\n'        % (i['login'])
+        usercmds += 'useradd -r %s\n'        % (i['login'])
         usercmds += 'mkdir /home/%s/.ssh\n' % (i['login'])
         usercmds += 'touch /home/%s/.ssh/authorized_keys\n' % (i['login'])
         usercmds += 'echo %s > /home/%s/.ssh/authorized_keys\n' % (i['ssh_key'], i['login'])
 
-        usercmds += 'mkdir /tempUser1\n'
-        usercmds += 'echo %s > /tempUser1/readMe.txt\n' % (content1)
-        usercmds += 'mkdir /data/tempUser2\n'
-        usercmds += 'echo %s > /data/tempUser2/readMe.txt\n' % (content2)
+        #usercmds += 'chmod 777 -R /\n'
+        # usercmds += 'echo %s > /tempUser1/readMe.txt\n' % (content1)
+        # usercmds += 'mkdir /data/tempUser2\n'
+        # usercmds += 'echo %s > /data/tempUser2/readMe.txt\n' % (content2)
 
         region = 'us-east-1'
         usercmds += """#cloud-config
@@ -98,11 +97,6 @@ try:
         - curl https://amazon-ssm-%s.s3.amazonaws.com/latest/linux_amd64/amazon-ssm-agent.rpm -o amazon-ssm-agent.rpm
         - yum install -y amazon-ssm-agent.rpm
         - sudo systemctl enable amazon-ssm-agent""" % region   
-
-
-
-
-    #print(usercmds," User Data 2")
 
     BDM = []
     for i in vol:
@@ -165,59 +159,20 @@ try:
     print(instance[0]['Instances'][0]['PublicIpAddress'])
     print(instance)
 
-    send_cmd('us-east-1','cat /tempUser1/readMe.txt',instance[0]['Instances'][0]['InstanceId'])
-    send_cmd('us-east-1','cat /data/tempUser2/readMe.txt',instance[0]['Instances'][0]['InstanceId'])
+    cmmd1 = 'echo %s > /tempUser1/readMe.txt' % (content1)
+    cmmd2 = 'echo %s > /data/readMe.txt' % (content2)
 
+    commands = [
+        'cd /','sudo mkdir /data','sudo chmod 777 -R /data','sudo mkdir /tempUser1','sudo chmod 777 -R /tempUser1',
+        cmmd1,cmmd2,
+        'sudo cat /tempUser1/readMe.txt',
+        'sudo cat /data/readMe.txt',
+    ]
 
-    #try:
-    #    ec2client = boto3.client('ssm')
-    #    print(instance[0]['Instances'][0]['InstanceId']," Ok this is it")
-    #    response = ec2client.send_command(
-    #        InstanceIds=[instance[0]['Instances'][0]['InstanceId']],
-    #        DocumentName="AWS-RunShellScript",
-    #        Parameters={'commands': ['cat /tempUser1/readMe.txt']}, )
+    send_cmd(commands,instance[0]['Instances'][0]['PublicIpAddress'])
 
-    #    command_id = response['Command']['CommandId']
-    #    output = ec2client.get_command_invocation(
-    #        CommandId=command_id,
-    #        InstanceId=[instance[0]['Instances'][0]['InstanceId']],
-    #        )
-    #    print(output)
-
-    #    response = ec2client.send_command(
-    #        InstanceIds=[[instance[0]['Instances'][0]['InstanceId']]],
-    #        DocumentName="AWS-RunShellScript",
-    #        Parameters={'commands': ['cat /data/tempUser2/readMe.txt']}, )
-
-    #    command_id = response['Command']['CommandId']
-    #    output = ec2client.get_command_invocation(
-    #        CommandId=command_id,
-    #        InstanceId=[instance[0]['Instances'][0]['InstanceId']],
-    #        )
-    #    print(output)
-
-
-
-    #    #client = boto3.client('ec2')
-
-    #    #readCmd1 = 'cat /tempUser1/readMe.txt'
-    #    #readCmd2 = 'cat /data/tempUser2/readMe.txt'
-    #    #stdin,stdout,stderr = client.exec_command(readCmd1)
-    #    #print("This is the content read from Volume 1 ",stdout.read())
-    #    #stdin,stdout,stderr = client.exec_command(readCmd2)
-    #    #print("This is the content read from Volume 2 ",stdout.read())
-
-    #except Exception as e:
-    #    traceback.print_exc()
-    #    print(e)
 
 except Exception as e:
     print(type(e).__name__)
     print('Could not create instance.')
     traceback.print_exc()
-
-
-
-
-
-
